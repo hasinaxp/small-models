@@ -57,10 +57,10 @@ for pattern, win in (("DS", 8), ("DSG", 8), ("S", 8), ("D", 8), ("S", 64), ("DS"
         outs = []
         for i, j in ((0, 5), (5, 10), (10, 13)):   # chunked prefill 5,5,3
             h = m.forward_hidden(x[:, i:j], kv_cache=cache)
-            outs.append(m.logit_proj(h))
+            outs.append(m.head(h))
         for t in range(13, 40):             # token by token
             h = m.forward_hidden(x[:, t:t + 1], kv_cache=cache)
-            outs.append(m.logit_proj(h))
+            outs.append(m.head(h))
         inc = torch.tanh(torch.cat(outs, 1) / 30) * 30
     check(f"cached decode == full forward [{pattern}, window {win}]", inc, full, 1e-4)
     with torch.no_grad():

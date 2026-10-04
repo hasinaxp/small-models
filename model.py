@@ -39,6 +39,18 @@ Training tricks (all cheap, all validated on ~100M-scale models):
   materialises.
 * **Looped middle blocks** via ``layer_schedule`` (extra depth, no extra params).
 
+Width knobs (all default to the classic tied-to-``n_dim`` sizes):
+
+* ``mixer_dim`` -- inner width of attention / DeltaNet (heads * head_dim),
+  decoupled from the residual width ``n_dim``.
+* ``ffn_hidden`` -- SwiGLU hidden width (default ~8/3 * n_dim).
+* ``emb_dim`` -- factorised embedding (ALBERT): a ``vocab x emb_dim`` table
+  plus ``emb_dim -> n_dim`` up-projection; the tied output head goes
+  ``n_dim -> emb_dim`` before the table.
+
+With these set, per-layer params grow linearly in ``n_dim`` instead of
+quadratically, so the residual stream can be widened cheaply.
+
 See ``optim.py`` for the matching Muon + AdamW optimizer.
 """
 
@@ -83,6 +95,10 @@ class ModelConfig:
     n_head: int = 4
     n_dim: int = 128
     n_seq: int = 256
+    # -- widths (None = derived from n_dim) --
+    mixer_dim: Optional[int] = None
+    ffn_hidden: Optional[int] = None
+    emb_dim: Optional[int] = None
     # -- hybrid layout --
     mixer_pattern: str = "DS"      # tiled over n_layer; D=DeltaNet S=window G=global
     window_size: int = 512
@@ -110,8 +126,8 @@ class ModelConfig:
     init_std: float = 0.02
 
     def validate(self):
-        if self.n_dim % self.n_head:
-            raise ValueError("n_dim must be divisible by n_head")
+        if (self.mixer_dim or self.n_dim) % self.n_head:
+            raise ValueError("mixer_dim (default n_dim) must be divisible by n_head")
         layer_schedule(self.n_layer, self.repeat_start, self.repeat_end,
                        self.repeat_times)
         expand_pattern(self.mixer_pattern, self.n_layer)
@@ -383,25 +399,28 @@ def chunk_gated_delta_rule(q, k, v, g, beta, state=None, chunk_size=64):
 class GatedDeltaNet(nn.Module):
     """Gated DeltaNet mixer. The recurrent state is the model's memory."""
 
-    def __init__(self, n_dim, n_head, conv_kernel=4, chunk_size=64):
+    def __init__(self, n_dim, n_head, conv_kernel=4, chunk_size=64,
+                 inner_dim=None):
         super().__init__()
+        inner = inner_dim or n_dim
         self.n_dim = n_dim
+        self.inner_dim = inner
         self.n_head = n_head
-        self.head_dim = n_dim // n_head
+        self.head_dim = inner // n_head
         self.conv_kernel = conv_kernel
         self.chunk_size = chunk_size
 
-        self.qkv_proj = nn.Linear(n_dim, 3 * n_dim, bias=False)
-        self.z_proj = nn.Linear(n_dim, n_dim, bias=False)       # output gate
+        self.qkv_proj = nn.Linear(n_dim, 3 * inner, bias=False)
+        self.z_proj = nn.Linear(n_dim, inner, bias=False)        # output gate
         self.ab_proj = nn.Linear(n_dim, 2 * n_head, bias=False)  # decay, beta
-        self.conv = nn.Conv1d(3 * n_dim, 3 * n_dim, conv_kernel,
-                              groups=3 * n_dim, bias=False)
+        self.conv = nn.Conv1d(3 * inner, 3 * inner, conv_kernel,
+                              groups=3 * inner, bias=False)
         # Mamba-2 style decay parametrisation: a_t = exp(-exp(A_log) * softplus(.)).
         self.A_log = nn.Parameter(torch.empty(n_head).uniform_(1, 16).log())
         dt = torch.exp(torch.empty(n_head).uniform_(math.log(1e-3), math.log(1e-1)))
         self.dt_bias = nn.Parameter(dt + torch.log(-torch.expm1(-dt)))  # softplus^-1
         self.norm = GatedRMSNorm(self.head_dim)
-        self.wo = nn.Linear(n_dim, n_dim, bias=False)
+        self.wo = nn.Linear(inner, n_dim, bias=False)
 
     def _causal_conv(self, xc, T, reset=None):
         """Depthwise causal conv written as K shifted taps. ``xc`` is already
@@ -457,7 +476,7 @@ class GatedDeltaNet(nn.Module):
 
         o = o.to(x.dtype).transpose(1, 2)                        # (B,T,H,d)
         z = self.z_proj(x).view(B, T, H, d)
-        o = self.norm(o, z).reshape(B, T, self.n_dim)
+        o = self.norm(o, z).reshape(B, T, self.inner_dim)
         return self.wo(o)
 
 
@@ -485,13 +504,15 @@ class Attention(nn.Module):
 
     def __init__(self, n_dim, n_head, n_kv_head=None, window=None,
                  rope_theta=10000.0, sink=True, output_gate=True,
-                 value_residual=True):
+                 value_residual=True, inner_dim=None):
         super().__init__()
-        if n_dim % n_head != 0:
-            raise ValueError("n_dim must be divisible by n_head")
+        inner = inner_dim or n_dim
+        if inner % n_head != 0:
+            raise ValueError("inner_dim (default n_dim) must be divisible by n_head")
         self.n_dim = n_dim
+        self.inner_dim = inner
         self.n_head = n_head
-        self.head_dim = n_dim // n_head
+        self.head_dim = inner // n_head
         self.window = window
         self.rope_theta = rope_theta
 
@@ -501,11 +522,11 @@ class Attention(nn.Module):
         self.n_kv_head = n_kv_head
         self.n_rep = n_head // n_kv_head
 
-        self.q_proj = nn.Linear(n_dim, n_dim, bias=False)
+        self.q_proj = nn.Linear(n_dim, inner, bias=False)
         self.k_proj = nn.Linear(n_dim, n_kv_head * self.head_dim, bias=False)
         self.v_proj = nn.Linear(n_dim, n_kv_head * self.head_dim, bias=False)
-        self.gate_proj = nn.Linear(n_dim, n_dim, bias=True) if output_gate else None
-        self.wo = nn.Linear(n_dim, n_dim, bias=False)
+        self.gate_proj = nn.Linear(n_dim, inner, bias=True) if output_gate else None
+        self.wo = nn.Linear(inner, n_dim, bias=False)
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
         # Sink: a learned key per kv head with a zero value. Attending to it
@@ -576,7 +597,7 @@ class Attention(nn.Module):
                 out = out[:, :, 1:]
         else:
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
-        out = out.transpose(1, 2).contiguous().view(B, T, self.n_dim)
+        out = out.transpose(1, 2).contiguous().view(B, T, self.inner_dim)
         if self.gate_proj is not None:
             out = out * torch.sigmoid(self.gate_proj(x))
         return self.wo(out), v_raw
@@ -617,18 +638,20 @@ class Block(nn.Module):
 
     def __init__(self, kind, n_dim, n_head, hidden_dim, *, n_kv_head=None,
                  window=None, rope_theta=10000.0, sink=True, output_gate=True,
-                 value_residual=True, conv_kernel=4, chunk_size=64, dropout=0.0):
+                 value_residual=True, conv_kernel=4, chunk_size=64, dropout=0.0,
+                 mixer_dim=None):
         super().__init__()
         if kind not in MIXER_KINDS:
             raise ValueError(f"unknown mixer kind {kind!r}")
         self.kind = kind
         self.mixer_norm = RMSNorm(n_dim)
         if kind == "D":
-            self.mixer = GatedDeltaNet(n_dim, n_head, conv_kernel, chunk_size)
+            self.mixer = GatedDeltaNet(n_dim, n_head, conv_kernel, chunk_size,
+                                       mixer_dim)
         else:
             self.mixer = Attention(
                 n_dim, n_head, n_kv_head, window if kind == "S" else None,
-                rope_theta, sink, output_gate, value_residual)
+                rope_theta, sink, output_gate, value_residual, mixer_dim)
         self.ffn_norm = RMSNorm(n_dim)
         self.ffn = SwiGLU(n_dim, hidden_dim)
         self.resid_dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
@@ -707,6 +730,9 @@ class Transformer(nn.Module):
         n_head=DEFAULT_NUM_HEADS,
         n_dim=DEFAULT_EMBEDDING_DIM,
         n_seq=DEFAULT_SEQ_LEN,
+        mixer_dim=None,
+        ffn_hidden=None,
+        emb_dim=None,
         mixer_pattern="DS",
         window_size=512,
         n_kv_head=None,
@@ -735,15 +761,18 @@ class Transformer(nn.Module):
         debug_token_range=False,
     ):
         super().__init__()
-        if n_dim % n_head != 0:
-            raise ValueError("n_dim must be divisible by n_head")
-        head_dim = n_dim // n_head
+        mixer_dim = mixer_dim or n_dim
+        emb_dim = emb_dim or n_dim
+        if mixer_dim % n_head != 0:
+            raise ValueError("mixer_dim (default n_dim) must be divisible by n_head")
+        head_dim = mixer_dim // n_head
         if head_dim % 2:
             raise ValueError(f"head_dim ({head_dim}) must be even for RoPE")
         if head_dim not in (32, 64, 128):
             warnings.warn(
                 f"head_dim={head_dim} misses the fast attention kernels; "
-                f"n_head={n_dim // 64} would give head_dim 64 at n_dim={n_dim}",
+                f"n_head={mixer_dim // 64} would give head_dim 64 at "
+                f"mixer_dim={mixer_dim}",
                 stacklevel=2,
             )
 
@@ -756,6 +785,9 @@ class Transformer(nn.Module):
             repeat_start, repeat_end, repeat_times
         self.n_head = n_head
         self.n_dim = n_dim
+        self.mixer_dim = mixer_dim
+        self.head_dim = head_dim
+        self.emb_dim = emb_dim
         self.n_seq = n_seq
         self.rope_theta = rope_theta
         self.kinds = expand_pattern(mixer_pattern, n_layer)
@@ -776,16 +808,22 @@ class Transformer(nn.Module):
         if n_head % self.n_kv_head:
             raise ValueError("n_head must be divisible by n_kv_head")
 
-        self.l_embeddings = nn.Embedding(vocab_size, n_dim)
+        self.l_embeddings = nn.Embedding(vocab_size, emb_dim)
+        # Factorised embedding: vocab x emb_dim table, projected up to n_dim on
+        # the way in and down to emb_dim before the (tied) head on the way out.
+        factored = emb_dim != n_dim
+        self.emb_proj = nn.Linear(emb_dim, n_dim, bias=False) if factored else None
+        self.logit_down = nn.Linear(n_dim, emb_dim, bias=False) if factored else None
         self.emb_dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
-        hidden_dim = swiglu_hidden_dim(n_dim)
+        hidden_dim = ffn_hidden or swiglu_hidden_dim(n_dim)
+        self.ffn_hidden = hidden_dim
         block_kw = dict(n_kv_head=self.n_kv_head, window=window_size,
                         rope_theta=rope_theta, sink=attention_sink,
                         output_gate=attn_output_gate,
                         value_residual=value_residual,
                         conv_kernel=gdn_conv_kernel, chunk_size=gdn_chunk_size,
-                        dropout=dropout)
+                        dropout=dropout, mixer_dim=mixer_dim)
         # The first *executed* attention layer is the value-residual source
         # and has no lambda of its own (an unused parameter breaks DDP).
         attn_layers = [l for l in self.layer_schedule if self.kinds[l] != "D"]
@@ -810,7 +848,7 @@ class Transformer(nn.Module):
                     if mtp_depth > 0 else None)
 
         self.final_norm = RMSNorm(n_dim)
-        self.logit_proj = nn.Linear(n_dim, vocab_size, bias=False)
+        self.logit_proj = nn.Linear(emb_dim, vocab_size, bias=False)
         if tie_embeddings:
             self.logit_proj.weight = self.l_embeddings.weight
 
@@ -830,6 +868,10 @@ class Transformer(nn.Module):
             elif name.endswith("gate_proj.bias"):
                 # sigmoid(3) ~ 0.95: the attention output gate starts open.
                 nn.init.constant_(p, 3.0)
+            elif name in ("emb_proj.weight", "logit_down.weight"):
+                # 1/sqrt(fan_in): the up-projected embedding keeps init_std
+                # scale, and the head input keeps the final norm's unit RMS.
+                nn.init.normal_(p, mean=0.0, std=p.size(1) ** -0.5)
 
     # -- construction -------------------------------------------------------
 
@@ -849,12 +891,24 @@ class Transformer(nn.Module):
                 or seq_len > self._rope_cached_len
                 or device != self._rope_device):
             self._rope_cos, self._rope_sin = precompute_rope(
-                self.n_dim // self.n_head, seq_len, device, self.rope_theta)
+                self.head_dim, seq_len, device, self.rope_theta)
             self._rope_cached_len = seq_len
             self._rope_device = device
         return self._rope_cos, self._rope_sin
 
     # -- forward ------------------------------------------------------------
+
+    def embed(self, idx):
+        """Token ids -> residual-width vectors (through the up-projection
+        when the embedding is factorised)."""
+        e = self.l_embeddings(idx)
+        return self.emb_proj(e) if self.emb_proj is not None else e
+
+    def head(self, h):
+        """Hidden states -> raw logits (before soft-capping)."""
+        if self.logit_down is not None:
+            h = self.logit_down(h)
+        return self.logit_proj(h)
 
     def forward_hidden(self, idx, start_pos=0, kv_cache=None, attn_mask=None):
         """Everything up to and including final_norm.
@@ -879,7 +933,7 @@ class Transformer(nn.Module):
             if attn_mask is not None:
                 raise ValueError("attn_mask is not supported with a kv_cache")
 
-        x = self.emb_dropout(self.l_embeddings(idx))
+        x = self.emb_dropout(self.embed(idx))
         x0 = x
         cos, sin = self._get_rope(max(pos + T, self.n_seq), x.device)
         reset = resets_from_mask(attn_mask)
@@ -924,13 +978,13 @@ class Transformer(nn.Module):
         if mode == "hidden":
             return self.forward_hidden(idx, start_pos, kv_cache, attn_mask)
         x = self.forward_hidden(idx, start_pos, kv_cache, attn_mask)
-        return softcap(self.logit_proj(x), self.logit_softcap), None
+        return softcap(self.head(x), self.logit_softcap), None
 
     # -- loss ---------------------------------------------------------------
 
     def _loss_chunk(self, h, targets, weights=None):
         """Projection + CE for one slice -> stacked (ce_sum, z_sum, w_sum)."""
-        logits = softcap(self.logit_proj(h).float(), self.logit_softcap)
+        logits = softcap(self.head(h).float(), self.logit_softcap)
         flat = logits.reshape(-1, self.vocab_size)
         tgt = targets.reshape(-1)
         valid = tgt != IGNORE_INDEX
@@ -977,7 +1031,7 @@ class Transformer(nn.Module):
 
         if self.mtp is not None and self.mtp_loss_weight and xs.size(1) > 2:
             cos, sin = self._get_rope(self.n_seq, h.device)
-            emb_next = self.l_embeddings(xs[:, 1:])
+            emb_next = self.embed(xs[:, 1:])
             m = None if attn_mask is None else attn_mask[:, :, :-1, :-1]
             h2 = self.mtp(h[:, :-1], emb_next, cos, sin, m)
             w2 = None if weights is None else weights[:, 1:]
@@ -997,7 +1051,7 @@ class Transformer(nn.Module):
         for i in range(0, hidden.size(1), chunk):
             h = hidden[:, i:i + chunk]
             t = ys[:, i:i + chunk]
-            logits = softcap(self.logit_proj(h).float(), self.logit_softcap)
+            logits = softcap(self.head(h).float(), self.logit_softcap)
             valid = t != IGNORE_INDEX
             safe = t.masked_fill(~valid, 0)
             logp = torch.log_softmax(logits, dim=-1)
@@ -1064,7 +1118,7 @@ class Transformer(nn.Module):
 
         for i in range(0, T, prefill_chunk):
             h = self.forward_hidden(idx[:, i:i + prefill_chunk], kv_cache=cache)
-        logits = softcap(self.logit_proj(h[:, -1]).float(), self.logit_softcap)
+        logits = softcap(self.head(h[:, -1]).float(), self.logit_softcap)
 
         done = torch.zeros(B, dtype=torch.bool, device=idx.device)
         for _ in range(max_count):
@@ -1087,7 +1141,7 @@ class Transformer(nn.Module):
             if eos_token_id is not None and bool(done.all()):
                 break
             h = self.forward_hidden(next_token, kv_cache=cache)
-            logits = softcap(self.logit_proj(h[:, -1]).float(), self.logit_softcap)
+            logits = softcap(self.head(h[:, -1]).float(), self.logit_softcap)
         return idx
 
     # -- bookkeeping --------------------------------------------------------
@@ -1111,16 +1165,18 @@ class Transformer(nn.Module):
 
     def estimate_flops_per_token(self):
         """6 * (weights multiplied through, per executed layer) + mixer cost."""
-        matmul = self.vocab_size * self.n_dim
+        matmul = self.vocab_size * self.emb_dim
+        if self.logit_down is not None:
+            matmul += 2 * self.emb_dim * self.n_dim
         mixer = 0
         for layer in self.layer_schedule:
             blk = self.blocks[layer]
             matmul += sum(p.numel() for p in blk.parameters())
             if blk.kind == "D":
-                mixer += 12 * self.n_dim * blk.mixer.chunk_size
+                mixer += 12 * self.mixer_dim * blk.mixer.chunk_size
             else:
                 span = self.n_seq if blk.kind == "G" else min(self.window_size, self.n_seq)
-                mixer += 12 * self.n_dim * span
+                mixer += 12 * self.mixer_dim * span
         if self.mtp is not None:
             matmul += sum(p.numel() for p in self.mtp.parameters())
         return 6 * matmul + mixer
