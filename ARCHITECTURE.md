@@ -131,3 +131,65 @@ The memory demonstrably stores and retrieves facts the window cannot see.
 * `longctx_eval.py` -- fixed-token context-length evaluation; env vars pick
   corpus, window, sequence length.
 * `recall_test.py` -- synthetic associative recall.
+
+## Training on smollm-corpus
+
+Two pipelines share `pretrain.py`'s data loader, checkpointing and flags.
+Every `ModelConfig` field is a command-line flag. The default model
+(`MODEL_DEFAULTS` in `pretrain.py`) uses the whole design: `DS`, window 512
+over 2048-token sequences, residual 896 with mixer 512 / FFN 1792,
+factorised embedding 256, blocks 5-8 looped twice (14 unique -> 18 executed
+layers). That is 96M params at inference plus a 7.6M training-only MTP head.
+Packed documents use document masks, so attention and the DeltaNet state
+never cross an EOS.
+
+### Distillation (recommended)
+
+```bash
+./run_distill.sh                   # student vocab -> teacher-token data -> distill.py
+python generate.py "Once upon a time"
+```
+
+* Teacher: SmolLM2-1.7B (49152 vocab). Student vocab: the teacher's BPE
+  truncated to ids < 16384 (`distill_vocab.py`). SmolLM2 numbers tokens in
+  merge order, so this is a valid BPE. Every teacher token is a fixed
+  sequence of 1-8 student tokens, and teacher token boundaries are always
+  student boundaries (checked on 3,000 documents: 100% identical, 1.097
+  student tokens per teacher token).
+* Mapping teacher distributions (`distill.py`), for a student token at depth
+  `d` inside teacher token `t_j`, using the teacher's distribution `p` at
+  `j - 1`:
+  * `d = 0` (~90% of positions) is exact: `q(s) = sum_t p(t) [first piece of t = s]`.
+  * `d > 0` is the teacher's conditional over the next piece given the
+    pieces already emitted (prefix trie). The paths "teacher token ends
+    here, next one starts with s" would need a second teacher pass. Their
+    share of the prefix mass (logged as `dropped_mass`, ~10% of interior
+    mass, about 1% of all target mass) is dropped and the rest renormalised.
+  * Checked against a brute-force implementation, and the per-token
+    probabilities telescope back to the teacher's.
+* Loss: `alpha * H(q, student) + (1 - alpha) * CE` with alpha 0.9, the same
+  for the MTP head (its soft target is `q` at the next position), plus z-loss.
+* Data is stored in teacher ids (`data/smollm_t49k`). Student ids are
+  derived exactly on the GPU. The teacher only runs on the prefix that
+  covers the student window.
+* Speed (A30): ~13K student tok/s. The teacher forward (~22K tok/s, 46%
+  MFU) is ~75% of the time, so 2B student tokens take ~40 h.
+
+### Pretraining from scratch
+
+```bash
+./run_pretrain.sh                  # own 16k BPE -> data -> pretrain.py
+```
+
+### Kernels
+
+* Gated DeltaNet uses the `flash-linear-attention` Triton kernel when it is
+  installed and on CUDA. Otherwise it uses the pure-PyTorch chunk form, which
+  stays the reference (`verify_model.py` check 5).
+* Under `torch.compile`, windowed / document-masked attention runs as
+  block-sparse FlexAttention, with the sink as key 0 (check 6). Eager mode
+  and decoding keep the SDPA path.
+* The document-reset short conv uses shifted slices instead of `unfold`,
+  whose bf16 backward took 60% of the step.
+* Together these took the hybrid student from 15.7K to 49K tok/s
+  (forward + backward, 8 x 2048, A30).

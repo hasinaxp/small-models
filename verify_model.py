@@ -5,18 +5,31 @@
 3. document mask -> DeltaNet reset agrees with running documents separately
 4. loss / backward / optimizer step run for every mixer kind, with and
    without activation checkpointing, MTP and looped blocks
+5. the fla Triton delta-rule kernel (if installed) == the pure-PyTorch path
+6. compiled FlexAttention path == SDPA path (window, doc mask, sink, GQA)
+
+Checks 1-3 are exact-arithmetic checks of the pure-PyTorch reference, so they
+run with the fla kernel switched off; 5 compares the kernel against it.
 """
 
 import sys
 import torch
 
-from model import (Transformer, chunk_gated_delta_rule,
+import model as model_mod
+from model import (Transformer, GatedDeltaNet, Attention, chunk_gated_delta_rule,
                    recurrent_gated_delta_rule, build_document_mask)
 from optim import build_optimizer
 
 torch.manual_seed(0)
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 ok = True
+
+
+def set_fla(m, on):
+    for mod in m.modules():
+        if isinstance(mod, GatedDeltaNet):
+            mod.use_fla = on
+    return m
 
 
 def check(name, a, b, tol):
@@ -50,6 +63,7 @@ for pattern, win in (("DS", 8), ("DSG", 8), ("S", 8), ("D", 8), ("S", 64), ("DS"
     m = Transformer(vocab_size=97, n_layer=4, n_head=4, n_dim=64, n_seq=64,
                     mixer_pattern=pattern, window_size=win, gdn_chunk_size=16,
                     repeat_start=1, repeat_end=3, repeat_times=2).to(DEV).eval()
+    set_fla(m, False)
     x = torch.randint(0, 97, (2, 40), device=DEV)
     with torch.no_grad():
         full, _ = m(x)
@@ -71,6 +85,7 @@ for pattern, win in (("DS", 8), ("DSG", 8), ("S", 8), ("D", 8), ("S", 64), ("DS"
 m = Transformer(vocab_size=50, n_layer=2, n_head=2, n_dim=32, n_seq=64,
                 mixer_pattern="DS", window_size=64, gdn_chunk_size=8,
                 unet_skips=False).to(DEV).eval()
+set_fla(m, False)
 EOS = 1
 a = torch.randint(2, 50, (1, 20), device=DEV)
 b = torch.randint(2, 50, (1, 20), device=DEV)
@@ -103,6 +118,73 @@ for kw in (dict(mixer_pattern="DS"), dict(mixer_pattern="DSG", activation_checkp
           + (f"  NO GRAD: {grads}" if grads else ""))
     if grads or not torch.isfinite(loss):
         ok = False
+
+# 5. fla kernel vs pure PyTorch ----------------------------------------------------
+if model_mod._fla_chunk_gdr is not None and DEV == "cuda":
+    torch.backends.cuda.matmul.allow_tf32 = False
+    m = Transformer(vocab_size=97, n_layer=4, n_head=2, n_dim=128, n_seq=256,
+                    mixer_pattern="DS", window_size=32).to(DEV).train()
+    x = torch.randint(2, 97, (2, 256), device=DEV)
+    x[:, 100] = 1
+    mask = build_document_mask(x, 1)
+    res = {}
+    for on in (False, True):
+        set_fla(m, on)
+        m.zero_grad()
+        logits, _ = m(x, attn_mask=mask)
+        logits.float().square().mean().backward()
+        res[on] = (logits.detach(), torch.cat([p.grad.flatten() for p in m.parameters()
+                                               if p.grad is not None]))
+    rel = lambda a, b: ((a - b).norm() / b.norm()).item()
+    for name, i in (("logits", 0), ("all grads", 1)):
+        err = rel(res[True][i], res[False][i])
+        flag = "ok " if err < 1e-2 else "FAIL"
+        ok &= err < 1e-2
+        print(f"[{flag}] fla kernel == pure PyTorch, fp32, doc mask: {name} rel err {err:.1e} (tol 1e-02)")
+    set_fla(m, True)
+    with torch.no_grad():
+        m.eval()
+        lp, _ = m(x[:1], attn_mask=mask[:1])
+        lb, _ = m(x[:1, 101:])
+    check("fla: packed-with-doc-mask == separate doc", lp[:, 101:], lb, 2e-3)
+else:
+    print("[skip] fla not installed or no CUDA: kernel check skipped")
+
+# 6. FlexAttention (compiled) vs SDPA -------------------------------------------------
+if model_mod.flex_attention is not None and DEV == "cuda":
+    torch.backends.cuda.matmul.allow_tf32 = False
+    for pattern, sink in (("S", True), ("DSG", True), ("S", False)):
+        torch.manual_seed(1)
+        m = Transformer(vocab_size=97, n_layer=3, n_head=8, n_kv_head=2, n_dim=256,
+                        n_seq=512, mixer_pattern=pattern, window_size=128,
+                        attention_sink=sink, mtp_depth=1).to(DEV).train()
+        with torch.no_grad():                    # non-trivial sink keys
+            for mod in m.modules():
+                if isinstance(mod, Attention) and mod.sink_k is not None:
+                    mod.sink_k.normal_(0, 1.0)
+        x = torch.randint(2, 97, (2, 300), device=DEV)
+        x[0, 77] = x[0, 200] = x[1, 150] = 1
+        mask = build_document_mask(x, 1)
+        res = {}
+        for flex in (False, True):
+            for mod in m.modules():
+                if isinstance(mod, Attention):
+                    mod.use_flex = flex
+            torch._dynamo.reset()
+            f = torch.compile(m)
+            m.zero_grad()
+            loss = f(x, targets=x, mode="loss", attn_mask=mask)
+            loss.backward()
+            res[flex] = (loss.detach(), torch.cat([p.grad.flatten() for p in m.parameters()
+                                                   if p.grad is not None]))
+        lerr = (res[True][0] - res[False][0]).abs().item()
+        gerr = ((res[True][1] - res[False][1]).norm() / res[False][1].norm()).item()
+        good = lerr < 1e-4 and gerr < 1e-3
+        ok &= good
+        print(f"[{'ok ' if good else 'FAIL'}] flex == sdpa (compiled) [{pattern}, sink={sink}]: "
+              f"loss err {lerr:.1e}, grads rel err {gerr:.1e}")
+else:
+    print("[skip] FlexAttention unavailable or no CUDA")
 
 print("\nALL OK" if ok else "\nSOME CHECKS FAILED")
 sys.exit(0 if ok else 1)

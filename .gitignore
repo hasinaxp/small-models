@@ -1,0 +1,7 @@
+data/
+checkpoints/
+tokenizer/
+__pycache__/
+*.pt
+!dataset/*.pt
+*.log

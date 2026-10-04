@@ -64,6 +64,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 
+try:
+    # Triton kernels for the chunked gated delta rule (flash-linear-attention).
+    # Optional: without them the pure-PyTorch chunk form below is used.
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule as _fla_chunk_gdr
+except ImportError:
+    _fla_chunk_gdr = None
+
+try:
+    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+except ImportError:
+    flex_attention = None
+
 DEFAULT_SEQ_LEN = 2048
 DEFAULT_EMBEDDING_DIM = 896
 DEFAULT_NUM_HEADS = 14
@@ -409,6 +421,7 @@ class GatedDeltaNet(nn.Module):
         self.head_dim = inner // n_head
         self.conv_kernel = conv_kernel
         self.chunk_size = chunk_size
+        self.use_fla = True     # Triton kernel when available (see top of file)
 
         self.qkv_proj = nn.Linear(n_dim, 3 * inner, bias=False)
         self.z_proj = nn.Linear(n_dim, inner, bias=False)        # output gate
@@ -430,13 +443,18 @@ class GatedDeltaNet(nn.Module):
         K = self.conv_kernel
         if reset is None:
             return self.conv(xc)
-        w = self.conv.weight[:, 0, :]                            # (C, K)
+        w = self.conv.weight[:, 0, :].to(xc.dtype)               # (C, K)
         doc = reset.to(torch.int32).cumsum(1)                    # (B,T)
         doc_pad = F.pad(doc, (K - 1, 0), value=-1)
-        same = (doc_pad.unfold(1, K, 1) == doc[..., None])       # (B,T,K)
-        taps = xc.unfold(2, K, 1)                                # (B,C,T,K)
-        taps = taps * same[:, None].to(taps.dtype)
-        return torch.einsum("bctk,ck->bct", taps, w.to(taps.dtype))
+        # Tap j reads x[t - (K-1) + j]; keep it only if that token is in t's
+        # document. Plain slices (not unfold): unfold's backward is a very
+        # slow index_put in bf16.
+        out = None
+        for j in range(K):
+            same = (doc_pad[:, j:j + T] == doc).to(xc.dtype)[:, None]   # (B,1,T)
+            tap = xc[:, :, j:j + T] * w[:, j, None] * same
+            out = tap if out is None else out + tap
+        return out
 
     def forward(self, x, cache: Optional[GDNCache] = None, reset=None):
         B, T, _ = x.shape
@@ -465,10 +483,23 @@ class GatedDeltaNet(nn.Module):
             g = g.masked_fill(reset[:, None, :], -50.0)
 
         state = cache.state if cache is not None else None
-        with torch.autocast(device_type=x.device.type, enabled=False):
-            if T <= 2:
+        if self.use_fla and _fla_chunk_gdr is not None and x.is_cuda and T > 2:
+            # Same recurrence, fused Triton kernel; (B,T,H,d) layout, fp32 state
+            # and gates. The kernel wants q/k/v/beta in one dtype (bf16 under
+            # autocast, where F.normalize alone would return fp32 q/k).
+            dt = v.dtype
+            o, S = _fla_chunk_gdr(
+                q.transpose(1, 2).to(dt), k.transpose(1, 2).to(dt), v.transpose(1, 2),
+                g.transpose(1, 2).contiguous(), beta.transpose(1, 2).to(dt).contiguous(),
+                scale=d ** -0.5,
+                initial_state=None if state is None else state.float(),
+                output_final_state=cache is not None)
+            o = o.transpose(1, 2)
+        elif T <= 2:
+            with torch.autocast(device_type=x.device.type, enabled=False):
                 o, S = recurrent_gated_delta_rule(q, k, v, g, beta, state)
-            else:
+        else:
+            with torch.autocast(device_type=x.device.type, enabled=False):
                 o, S = chunk_gated_delta_rule(q, k, v, g, beta, state,
                                               self.chunk_size)
         if cache is not None:
@@ -535,6 +566,34 @@ class Attention(nn.Module):
         self.sink_k = nn.Parameter(torch.zeros(n_kv_head, self.head_dim)) if sink else None
         # (1, 0): identical to plain attention at init; the mix is learned.
         self.v_lambda = nn.Parameter(torch.tensor([1.0, 0.0])) if value_residual else None
+        self.use_flex = True    # block-sparse FlexAttention inside torch.compile
+
+    def _flex(self, q, k, v, attn_mask):
+        """Training path for window and/or document masks: FlexAttention only
+        visits the blocks the mask allows (a 512 window over 2048 tokens is
+        ~1/4 of the causal triangle) instead of a dense masked T x T. Same
+        result as the SDPA path, including the sink: it is key 0 (zero value),
+        visible to every query; real key j sits at index j + 1."""
+        B, H, T, d = q.shape
+        window = self.window
+        off = 1 if self.sink_k is not None else 0
+        if off:
+            sk = self.sink_k.to(k.dtype)[None, :, None, :].expand(B, -1, 1, -1)
+            k = torch.cat((sk, k), dim=2)
+            v = torch.cat((torch.zeros_like(sk), v), dim=2)
+
+        def mask_mod(b, h, qi, kj):
+            ki = kj - off
+            keep = (qi >= ki) & (ki >= 0)
+            if window is not None:
+                keep = keep & (qi - ki < window)
+            if attn_mask is not None:
+                keep = keep & attn_mask[b, 0, qi, ki.clamp(min=0)]
+            return keep | (kj < off)
+
+        bm = create_block_mask(mask_mod, B if attn_mask is not None else None,
+                               None, T, T + off, device=q.device)
+        return flex_attention(q, k, v, block_mask=bm, enable_gqa=self.n_rep > 1)
 
     def forward(self, x, cos, sin, pos=0, cache: Optional[AttentionCache] = None,
                 attn_mask=None, v_first=None):
@@ -555,6 +614,13 @@ class Attention(nn.Module):
 
         fast = (cache is None and attn_mask is None
                 and (self.window is None or self.window >= T))
+        if (not fast and cache is None and self.use_flex and flex_attention is not None
+                and torch.compiler.is_compiling()):
+            out = self._flex(q, k, v, attn_mask)
+            out = out.transpose(1, 2).contiguous().view(B, T, self.inner_dim)
+            if self.gate_proj is not None:
+                out = out * torch.sigmoid(self.gate_proj(x))
+            return self.wo(out), v_raw
         if fast:
             # Plain causal attention -> flash kernel, no mask. With a sink we
             # prepend the sink key *and* a dummy query so that under is_causal
@@ -715,6 +781,8 @@ def resets_from_mask(attn_mask: Optional[torch.Tensor]) -> Optional[torch.Tensor
         return None
     sees_prev = m[:, 1:, :-1].diagonal(dim1=-2, dim2=-1)
     reset = torch.cat((torch.zeros_like(sees_prev[:, :1]), ~sees_prev), dim=1)
+    if torch.compiler.is_compiling():
+        return reset            # an all-False reset is a no-op; .any() would break the graph
     return reset if bool(reset.any()) else None
 
 
